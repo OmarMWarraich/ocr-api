@@ -101,39 +101,74 @@ This utility handles missing filenames and avoids duplicating file extensions wh
 
 ## Step 7: Add the OCR endpoint
 
-Update `main.py` to import the helper modules and expose the POST endpoint that accepts one or more image uploads:
+Update `main.py` to import the helper modules and expose the POST endpoint that accepts one or more image uploads. Use the modern `Annotated` syntax and override `app.openapi()` so Swagger UI renders each array item as a file picker:
 
 ```python
-from typing import List
+from typing import Annotated
 import time
+import asyncio
 import ocr
 import utils
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.openapi.utils import get_openapi
 
 app = FastAPI()
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    openapi_schema = get_openapi(
+        title="OCR API",
+        version="0.1.0",
+        description="Extract text from images using Tesseract OCR.",
+        routes=app.routes,
+    )
+    # Swagger UI renders array file uploads more reliably when each item
+    # uses OpenAPI 3.0's `format: binary` instead of OpenAPI 3.1's
+    # `contentMediaType`. Patch the generated request-body schema accordingly.
+    body_schema = openapi_schema["components"]["schemas"].get(
+        "Body_extract_text_api_v1_extract_text_post"
+    )
+    if body_schema:
+        body_schema["properties"]["Images"]["items"] = {
+            "type": "string",
+            "format": "binary",
+        }
+
+    app.openapi_schema = openapi_schema
+    return openapi_schema
+
+
+app.openapi = custom_openapi
+
 
 @app.get("/")
 def home():
     return {"message": "Visit the endpoint: /api/v1/extract_text to perform OCR."}
 
 @app.post("/api/v1/extract_text")
-async def extract_text(Images: List[UploadFile] = File(...)):
+async def extract_text(Images: Annotated[list[UploadFile], File(...)]):
     response = {}
     s = time.time()
+    tasks = []
     for img in Images:
         if not img.filename:
             raise HTTPException(status_code=400, detail="Uploaded file is missing a filename")
 
         print("Images Uploaded: ", img.filename)
         temp_file = utils._save_file_to_server(img, path="./", save_as=img.filename)
-        text = await ocr.read_image(temp_file)
-        response[img.filename] = text
+        tasks.append(asyncio.create_task(ocr.read_image(temp_file)))
+    text = await asyncio.gather(*tasks)
+    for i in range(len(text)):
+        response[Images[i].filename] = text[i]
     response["Time Taken"] = round((time.time() - s), 2)
 
     return response
 ```
 
-The endpoint saves each image, runs OCR on it, and returns a dictionary mapping filenames to extracted text plus the total time taken.
+The endpoint saves each image, runs OCR concurrently with `asyncio.gather`, and returns a dictionary mapping filenames to extracted text plus the total time taken. The `custom_openapi()` workaround ensures Swagger UI shows a **Choose File** widget for every item in the `Images` array.
 
 ## Step 8: Run the development server
 
@@ -161,6 +196,42 @@ Test the OCR endpoint with a sample image:
 curl -X POST "http://127.0.0.1:8000/api/v1/extract_text" \
      -F "Images=@sample_image.png"
 ```
+
+## Step 9: Fix the Swagger UI "Add string item" problem
+
+After wiring up the endpoint, visiting `/docs` and expanding `POST /api/v1/extract_text` showed an **Add string item** button instead of a **Choose File** picker. Typing or pasting a file path into that text box caused FastAPI to reject the request with:
+
+```json
+{"detail":[{"type":"value_error","loc":["body","Images",0],"msg":"Value error, Expected UploadFile, received: <class 'str'>","input":"~/Downloads/test.png",...}]}
+```
+
+The root cause: FastAPI emits an OpenAPI 3.1 schema by default, where binary arrays are represented with `contentMediaType: application/octet-stream`. Swagger UI v5 does not always render that as a file input, so it fell back to a plain string array.
+
+The corrective steps were:
+
+1. Switch the endpoint signature to the modern `Annotated` form:
+
+   ```python
+   async def extract_text(Images: Annotated[list[UploadFile], File(...)]):
+   ```
+
+2. Override `app.openapi()` in `main.py` with `fastapi.openapi.utils.get_openapi()`.
+3. Locate the generated request-body schema (`Body_extract_text_api_v1_extract_text_post`).
+4. Patch `properties.Images.items` from:
+
+   ```json
+   {"type": "string", "contentMediaType": "application/octet-stream"}
+   ```
+
+   to:
+
+   ```json
+   {"type": "string", "format": "binary"}
+   ```
+
+   This is the OpenAPI 3.0 representation for binary file uploads, which Swagger UI reliably renders as **Choose File** widgets for every array element.
+
+After the patch, `/docs` shows **Choose File** buttons under the `Images` array, and executing the endpoint from the UI works the same as the curl command.
 
 ## Next Steps
 
